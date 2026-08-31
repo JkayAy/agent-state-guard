@@ -1,4 +1,4 @@
-"""Deterministic state-graph orchestration.
+"""Deterministic state-graph orchestration with retry and fallback mechanics.
 
 `DeterministicGraph` wraps a sequence of node functions so that:
 
@@ -10,6 +10,13 @@
    describing what ran, how long it took, and a content hash of the state
    before and after. This is the basis for the audit log and replay
    mechanics implemented in later modules.
+3. A node may be registered with a `RetryPolicy` and/or a `fallback` node
+   name. On failure, the node is retried according to its policy; if every
+   attempt fails, execution routes to the fallback node (if one is
+   registered) instead of aborting the run. Every attempt -- including
+   failed ones and the fallback invocation -- produces its own
+   `StateTransitionRecord`, so the audit log always shows the complete
+   sequence of what was tried, not just the final outcome.
 
 If LangGraph is installed, `to_langgraph()` compiles the same node registry
 into a real `langgraph.graph.StateGraph`, so this library's guarantees hold
@@ -23,9 +30,10 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Optional
 
-from .exceptions import SchemaViolationError
+from .exceptions import MaxRetriesExceededError, SchemaViolationError
+from .retry import RetryPolicy
 from .schemas import AgentState, NodeStatus, StateTransitionRecord
 
 try:
@@ -34,7 +42,6 @@ try:
     LANGGRAPH_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised in environments without langgraph
     LANGGRAPH_AVAILABLE = False
-
 
 NodeFn = Callable[[AgentState], AgentState]
 
@@ -56,6 +63,8 @@ def stable_hash(state: AgentState) -> str:
 class NodeSpec:
     name: str
     fn: NodeFn
+    retry_policy: Optional[RetryPolicy] = None
+    fallback: Optional[str] = None
 
 
 @dataclass
@@ -75,18 +84,34 @@ class DeterministicGraph:
     def node_names(self) -> list[str]:
         return list(self._order)
 
-    def add_node(self, name: str, fn: NodeFn) -> "DeterministicGraph":
+    def add_node(
+        self,
+        name: str,
+        fn: NodeFn,
+        *,
+        retry_policy: Optional[RetryPolicy] = None,
+        fallback: Optional[str] = None,
+    ) -> "DeterministicGraph":
         if not name:
             raise ValueError("node name must be non-empty")
         if name in self._nodes:
             raise ValueError(f"node {name!r} is already registered")
-        self._nodes[name] = NodeSpec(name=name, fn=fn)
+        self._nodes[name] = NodeSpec(
+            name=name, fn=fn, retry_policy=retry_policy, fallback=fallback
+        )
         self._order.append(name)
         return self
 
-    def _execute_node(
-        self, spec: NodeSpec, state: AgentState
+    def _run_attempt(
+        self, spec: NodeSpec, state: AgentState, *, attempt: int
     ) -> tuple[AgentState, StateTransitionRecord]:
+        """Run a single attempt of `spec` against `state`.
+
+        Returns the validated resulting state and its transition record on
+        success. Raises `SchemaViolationError` (with a `record` attached)
+        on any failure -- an execution exception, a non-`AgentState`
+        return value, or a value that fails re-validation.
+        """
         input_hash = stable_hash(state)
         start = time.perf_counter()
 
@@ -101,6 +126,7 @@ class DeterministicGraph:
                 status=NodeStatus.FAILED,
                 input_hash=input_hash,
                 error=f"{type(exc).__name__}: {exc}",
+                attempt=attempt,
                 duration_ms=duration_ms,
             )
             raise SchemaViolationError(
@@ -117,6 +143,7 @@ class DeterministicGraph:
                 status=NodeStatus.FAILED,
                 input_hash=input_hash,
                 error=f"returned {type(candidate).__name__}, expected AgentState",
+                attempt=attempt,
                 duration_ms=duration_ms,
             )
             raise SchemaViolationError(
@@ -140,6 +167,7 @@ class DeterministicGraph:
                 status=NodeStatus.FAILED,
                 input_hash=input_hash,
                 error=f"output failed re-validation: {exc}",
+                attempt=attempt,
                 duration_ms=duration_ms,
             )
             raise SchemaViolationError(
@@ -155,9 +183,66 @@ class DeterministicGraph:
             status=NodeStatus.SUCCEEDED,
             input_hash=input_hash,
             output_hash=stable_hash(validated),
+            attempt=attempt,
             duration_ms=duration_ms,
         )
         return validated, record
+
+    def _execute_node(
+        self, spec: NodeSpec, state: AgentState
+    ) -> tuple[AgentState, list[StateTransitionRecord]]:
+        """Execute `spec` with its retry policy and fallback routing.
+
+        Returns the resulting state and the complete list of transition
+        records produced along the way -- every failed attempt, plus
+        either the eventual success or the fallback invocation's records.
+        Only raises if every attempt fails and no fallback is registered
+        (or the fallback itself fails).
+        """
+        policy = spec.retry_policy or RetryPolicy(max_attempts=1)
+        records: list[StateTransitionRecord] = []
+        last_error: Optional[SchemaViolationError] = None
+
+        for attempt in range(1, policy.max_attempts + 1):
+            delay = policy.delay_for_attempt(attempt)
+            if delay > 0:
+                policy.sleep_fn(delay)
+            try:
+                validated, record = self._run_attempt(spec, state, attempt=attempt)
+                records.append(record)
+                return validated, records
+            except SchemaViolationError as exc:
+                last_error = exc
+                if exc.record is not None:
+                    records.append(exc.record)
+
+        assert last_error is not None  # at least one attempt always runs
+
+        if spec.fallback is not None:
+            if spec.fallback not in self._nodes:
+                raise SchemaViolationError(
+                    f"node {spec.name!r} declares unknown fallback {spec.fallback!r}",
+                    record=last_error.record,
+                ) from last_error
+            fallback_spec = self._nodes[spec.fallback]
+            fallback_state, fallback_records = self._execute_node(fallback_spec, state)
+            # Re-tag the fallback's successful record as FALLBACK so the
+            # audit log distinguishes "this is the primary path" from
+            # "this ran because the primary path exhausted its retries".
+            retagged = [
+                r.model_copy(update={"status": NodeStatus.FALLBACK})
+                if r.status == NodeStatus.SUCCEEDED
+                else r
+                for r in fallback_records
+            ]
+            records.extend(retagged)
+            return fallback_state, records
+
+        raise MaxRetriesExceededError(
+            f"node {spec.name!r} exhausted {policy.max_attempts} attempt(s) "
+            "with no fallback registered",
+            record=last_error.record,
+        ) from last_error
 
     def run(self, initial_state: AgentState) -> ExecutionResult:
         """Execute all registered nodes in registration order.
@@ -171,8 +256,8 @@ class DeterministicGraph:
         transitions: list[StateTransitionRecord] = []
         for name in self._order:
             spec = self._nodes[name]
-            state, record = self._execute_node(spec, state)
-            transitions.append(record)
+            state, node_records = self._execute_node(spec, state)
+            transitions.extend(node_records)
             state = state.model_copy(update={"step": state.step + 1})
             if state.terminal:
                 break
@@ -183,8 +268,9 @@ class DeterministicGraph:
 
         Requires the optional `langgraph` dependency
         (`pip install agent-state-guard[langgraph]`). Each node is wrapped
-        with the same validation used by `run()`, so schema guarantees are
-        identical regardless of which executor drives the graph.
+        with the same validation, retry, and fallback logic used by
+        `run()`, so schema guarantees are identical regardless of which
+        executor drives the graph.
         """
         if not LANGGRAPH_AVAILABLE:
             raise ImportError(
@@ -198,7 +284,7 @@ class DeterministicGraph:
             spec = self._nodes[name]
 
             def _wrapped(state: AgentState, _spec: NodeSpec = spec) -> AgentState:
-                validated, _record = self._execute_node(_spec, state)
+                validated, _records = self._execute_node(_spec, state)
                 return validated
 
             graph.add_node(name, _wrapped)
