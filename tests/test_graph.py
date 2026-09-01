@@ -32,11 +32,17 @@ def test_run_executes_nodes_in_order_and_increments_step(make_state):
     assert all(t.status == NodeStatus.SUCCEEDED for t in result.transitions)
 
 
-def test_schema_violation_when_node_returns_wrong_type(make_state):
+def test_schema_violation_with_no_fallback_surfaces_as_max_retries_exceeded(make_state):
+    # A node returning the wrong type is a SchemaViolationError internally,
+    # but with no fallback registered, _execute_node re-raises it wrapped as
+    # MaxRetriesExceededError once the (here, single) attempt budget is
+    # exhausted. The original SchemaViolationError is preserved as the
+    # exception's __cause__ for anyone who needs to inspect it.
     graph = DeterministicGraph()
     graph.add_node("bad", lambda state: {"not": "a state"})
-    with pytest.raises(SchemaViolationError):
+    with pytest.raises(MaxRetriesExceededError) as exc_info:
         graph.run(make_state())
+    assert isinstance(exc_info.value.__cause__, SchemaViolationError)
 
 
 def test_retry_then_success(make_state):
