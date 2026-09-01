@@ -55,7 +55,13 @@ class ToolCallRequest(BaseModel):
 
 
 class ToolCallResult(BaseModel):
-    """The validated outcome of a single tool call attempt."""
+    """The validated outcome of a single tool call attempt.
+
+    attempt allows 0 as a sentinel meaning "no attempt was actually
+    made" -- e.g. an open circuit breaker short-circuiting the call before
+    ever invoking the underlying tool. Attempts that did run are numbered
+    starting at 1, matching RetryPolicy's convention.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -65,14 +71,14 @@ class ToolCallResult(BaseModel):
     output: Any = None
     error: str | None = None
     latency_ms: float = Field(ge=0)
-    attempt: int = Field(ge=1, default=1)
+    attempt: int = Field(ge=0, default=1)
 
 
 class AgentState(BaseModel):
     """The single canonical state object that flows through the graph.
 
     Nodes receive an AgentState and must return an AgentState (or raise).
-    No node may smuggle extra fields through -- `extra="forbid"` means an
+    No node may smuggle extra fields through -- extra="forbid" means an
     unexpected key anywhere in the payload is a validation error, not a
     silently-ignored typo.
     """
